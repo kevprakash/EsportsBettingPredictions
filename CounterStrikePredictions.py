@@ -132,14 +132,19 @@ def readAndProcessWMAData(load=False, perRound=False):
 networkModel = FFN(hiddenSizes=[64, 64, 32])
 
 
-def train(xData, yKills, yHeadshots, epochs=5):
+def train(xData, yKills, yHeadshots, epochs=10):
     optim = Adam(networkModel.parameters(), lr=1e-5)    # 1e-5 best LR so far
 
-    def MAPE(yPred, yReal, eps=1e-5):
-        APE = torch.abs((yReal - yPred)/(yReal + eps))
-        return torch.mean(APE)
+    def BalancedMSE(yPred, yReal):
+        mse = MSELoss(reduction='none')(yPred, yReal)
+        errorMeans = torch.mean(mse, dim=0)
+        realMeans = torch.mean(yReal, dim=0)
+        SRM = torch.sum(realMeans, dim=0, keepdim=True)
+        catWeights = realMeans/SRM
+        weightedMean = torch.dot(errorMeans, catWeights)
+        return weightedMean
 
-    lossFunc = MSELoss()
+    lossFunc = BalancedMSE
     batchSize = 64                                      # 64 best so far
 
     print(xData.shape)
@@ -157,6 +162,7 @@ def train(xData, yKills, yHeadshots, epochs=5):
 
         x = torch.Tensor(xy[:, :-2])
         y = torch.Tensor(xy[:, -2:])
+        batchCount = 0
 
         while startIndex < len(x):
             batch = x[startIndex:endIndex]
@@ -164,16 +170,19 @@ def train(xData, yKills, yHeadshots, epochs=5):
 
             predY = networkModel(batch)
             # print(torch.cat([predY, target], dim=1))
-            loss = lossFunc(predY, target) ** 0.5
+            loss = lossFunc(predY, target)
 
-            losses.append([loss.item()])
-            if len(losses) % 100 == 0:
-                print(loss.item())
+            losses.append(loss.item() ** 0.5)
+            if len(losses) % 1000 == 0:
+                print(sum(losses[-1000:])/1000)
             loss.backward()
             optim.step()
 
             startIndex = endIndex
             endIndex = min(len(x), endIndex + batchSize)
+            batchCount += 1
+
+        print("Epoch " + str(e) + " Avg Loss:", sum(losses[-batchCount:])/batchCount)
 
     return losses
 
