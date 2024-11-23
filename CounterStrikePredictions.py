@@ -11,7 +11,7 @@ pd.set_option('display.max_columns', None)
 
 
 def readAndProcessRawData(load=False, perRound=False):
-    IDCols = ["Name", "Date", "Map", "Map Number"]
+    IDCols = ["Name", "Date", "Map Number", "Map"]
     totalValues = ["Kills", "Headshots", "Assists", "Deaths"]
     summaryValues = ["Kast", "ADR", "Rating"]
     valueCols = totalValues + summaryValues
@@ -30,6 +30,7 @@ def readAndProcessRawData(load=False, perRound=False):
 
         data["Kast"] = data["Kast"].replace('%', '', regex=True).astype("float")
         data["ADR"] = data["ADR"].replace("-", 0).astype("float")
+        data["Map Number"] = data["Map Number"].replace("Single Map", 1).astype("float")
 
         truncatedData = data[IDCols + valueCols + ["Team Score", "Opponent Score"]].copy()
 
@@ -46,10 +47,29 @@ def readAndProcessRawData(load=False, perRound=False):
     return fittingData
 
 
+windowLength = 8
+weights = [0.5 ** i for i in range(1, windowLength)]
+weights = np.array(weights + [1 - sum(weights)])
+
+
+def truncateWeight(w, wl):
+    tw = w[:wl]
+    tw = tw[::-1]
+    tw = tw / sum(tw)
+    return tw
+
+
+def weightedMovingAverage(x):
+
+    adjustedWeights = [truncateWeight(weights, l) for l in range(len(weights) + 1)]
+    truncatedWeights = adjustedWeights[len(x)]
+    return np.dot(x, truncatedWeights)
+
+
 def readAndProcessWMAData(load=False, perRound=False):
     IDCols = ["Name", "Date", "Map", "Map Number"]
     totalValues = ["Kills", "Headshots", "Assists", "Deaths"]
-    summaryValues = ["Kast", "ADR", "Rating"]
+    summaryValues = ["Kast", "ADR", "Rating", "Team Score", "Opponent Score"]
     valueCols = totalValues + summaryValues
 
     if load:
@@ -67,7 +87,7 @@ def readAndProcessWMAData(load=False, perRound=False):
         data["Kast"] = data["Kast"].replace('%', '', regex=True).astype("float")
         data["ADR"] = data["ADR"].replace("-", 0).astype("float")
 
-        truncatedData = data[IDCols + valueCols + ["Team Score", "Opponent Score"]].copy()
+        truncatedData = data[IDCols + valueCols].copy()
 
         if perRound:
             # Change relevant metrics to per-round
@@ -77,23 +97,6 @@ def readAndProcessWMAData(load=False, perRound=False):
                 truncatedData[tv] = truncatedData[tv]/truncatedData["Rounds"]
 
         playerAvg = truncatedData.sort_values(by=IDCols)
-
-        windowLength = 8
-
-        weights = [0.5 ** i for i in range(1, windowLength)]
-        weights = np.array(weights + [1 - sum(weights)])
-
-        def truncateWeight(w, wl):
-            tw = w[:wl]
-            tw = tw[::-1]
-            tw = tw/sum(tw)
-            return tw
-
-        adjustedWeights = [truncateWeight(weights, l) for l in range(len(weights) + 1)]
-
-        def weightedMovingAverage(x):
-            truncatedWeights = adjustedWeights[len(x)]
-            return np.dot(x, truncatedWeights)
 
         def applyWMA(g, prefix=''):
             for col in valueCols:
@@ -108,65 +111,76 @@ def readAndProcessWMAData(load=False, perRound=False):
             return applyWMA(g, prefix='Map Num')
 
         playerAvg = playerAvg.groupby("Name").apply(applyWMA).reset_index(drop=True)
-        playerAvg = playerAvg.groupby(["Name", "Map"]).apply(applyWMAMap).reset_index(drop=True)
+        # playerAvg = playerAvg.groupby(["Name", "Map"]).apply(applyWMAMap).reset_index(drop=True)
         playerAvg = playerAvg.groupby(["Name", "Map Number"]).apply(applyWMAMapNum).reset_index(drop=True)
 
         fittingData = playerAvg.dropna().copy()
 
         fittingData.to_csv("Data/CS/FittingData.csv" if perRound else "Data/CS/FittingDataTotals.csv")
 
-    xCols = [[x + " Avg", "Map " + x + " Avg", "Map Num " + x + " Avg"] for x in valueCols]
+    # xCols = [[x + " Avg", "Map " + x + " Avg", "Map Num " + x + " Avg"] for x in valueCols]
+    xCols = [[x + " Avg", "Map Num " + x + " Avg"] for x in valueCols]
+    # xCols = [[x + " Avg"] for x in valueCols]
     xCols = [x for l in xCols for x in l]
     # xCols = [x + " Avg" for x in valueCols]
 
-    x = fittingData[xCols + ["Team Score", "Opponent Score"]].to_numpy()
+    print(xCols)
 
-    yK = fittingData[["Kills"]].to_numpy()
-    yH = fittingData[["Headshots"]].to_numpy()
+    x = fittingData[xCols].to_numpy()
 
-    return fittingData, x, yK, yH, xCols
+    y = fittingData[valueCols].to_numpy()
+
+    return fittingData, x, y, xCols
 
 
 # lrK = LinearRegression(fit_intercept=False)
 # lrH = LinearRegression(fit_intercept=False)
-networkModel = FFN(hiddenSizes=[64, 64, 32])
+networkModel = FFN(hiddenSizes=[128, 64])
 
 
-def train(xData, yKills, yHeadshots, epochs=10):
+def loadModel():
+    networkModel.load_state_dict(torch.load("Models/CSPredModel.pt", weights_only=True))
+    networkModel.eval()
+
+
+def train(xData, yData, epochs=5):
+    networkModel.cuda()
     optim = Adam(networkModel.parameters(), lr=1e-5)    # 1e-5 best LR so far
 
     def BalancedMSE(yPred, yReal):
+        assert yPred.shape == yReal.shape
         mse = MSELoss(reduction='none')(yPred, yReal)
         errorMeans = torch.mean(mse, dim=0)
         realMeans = torch.mean(yReal, dim=0)
-        SRM = torch.sum(realMeans, dim=0, keepdim=True)
-        catWeights = realMeans/SRM
-        weightedMean = torch.dot(errorMeans, catWeights)
-        return weightedMean
+        weightedMean = errorMeans/(realMeans ** 2)
+        return torch.mean(weightedMean, dim=0)
 
     lossFunc = BalancedMSE
     batchSize = 64                                      # 64 best so far
 
     print(xData.shape)
+    print(yData.shape)
 
-    x = xData
-    y = np.concatenate([yKills, yHeadshots], axis=1)
+    x = xData.copy()
+    y = yData.copy()
     losses = []
 
     for e in range(epochs):
         startIndex = 0
         endIndex = min(len(xData), startIndex + batchSize)
 
+        xSize = x.shape[1]
+
         xy = np.concatenate([x, y], axis=1)
         np.random.shuffle(xy)
 
-        x = torch.Tensor(xy[:, :-2])
-        y = torch.Tensor(xy[:, -2:])
+        xTensor = torch.Tensor(xy[:, :xSize]).cuda()
+        yTensor = torch.Tensor(xy[:, xSize:]).cuda()
         batchCount = 0
 
         while startIndex < len(x):
-            batch = x[startIndex:endIndex]
-            target = y[startIndex:endIndex]
+            batch = xTensor[startIndex:endIndex]
+            target = yTensor[startIndex:endIndex]
 
             predY = networkModel(batch)
             # print(torch.cat([predY, target], dim=1))
@@ -182,7 +196,10 @@ def train(xData, yKills, yHeadshots, epochs=10):
             endIndex = min(len(x), endIndex + batchSize)
             batchCount += 1
 
-        print("Epoch " + str(e) + " Avg Loss:", sum(losses[-batchCount:])/batchCount)
+        print("Epoch " + str(e + 1) + " Avg Loss:", sum(losses[-batchCount:])/batchCount)
+
+    networkModel.cpu()
+    torch.save(networkModel.state_dict(), "Models/CSPredModel.pt")
 
     return losses
 
@@ -195,9 +212,10 @@ def predict(xData):
 
 
 def run():
-    fittingData, x, yK, yH, xCols = readAndProcessWMAData(load=True)
+    fittingData, x, y, xCols = readAndProcessWMAData(load=True)
     trainSize = int(len(x) * 0.9)
-    train(x[:trainSize], yK[:trainSize], yH[:trainSize])
+    train(x[:trainSize], y[:trainSize])
+    # loadModel()
     fittingData["Kills Pred"], fittingData["Headshots Pred"] = predict(x)
 
     check = fittingData[["Name", "Date", "Map", "Map Number", "Kills Pred", "Kills", "Headshots Pred", "Headshots"] + xCols].copy()
@@ -248,4 +266,142 @@ def run():
     displayPredictions(aggregate, category='Headshots')
 
 
-run()
+def getLatestPlayerData(load=False):
+    IDCols = ["Name", "Date", "Map Number", "Map"]
+    totalValues = ["Kills", "Headshots", "Assists", "Deaths"]
+    summaryValues = ["Kast", "ADR", "Rating"]
+    valueCols = totalValues + summaryValues  + ["Team Score", "Opponent Score"]
+
+    if not load:
+        data = pd.read_csv("Data/CS/2024.csv")
+        data["Date"] = pd.to_datetime(data["Date"], format='%Y-%m-%d %H:%M')
+        data["Kast"] = data["Kast"].replace('%', '', regex=True).astype("float")
+        data["ADR"] = data["ADR"].replace("-", 0).astype("float")
+        data["Map Number"] = data["Map Number"].replace("Single Map", 1).astype("float")
+
+        truncatedData = data[IDCols + valueCols].copy()
+        playerAvg = truncatedData.dropna().copy().sort_values(by=IDCols)
+
+        def applyWMA(g, prefix=''):
+            for col in valueCols:
+                p = (prefix + ' ') if len(prefix) > 0 else ''
+                g[p + col + " Avg"] = g[col].rolling(window=len(weights), min_periods=1).apply(weightedMovingAverage, raw=True)
+            return g
+
+        def applyWMAMap(g):
+            return applyWMA(g, prefix='Map')
+
+        def applyWMAMapNum(g):
+            return applyWMA(g, prefix='Map Num')
+
+        playerAvg = playerAvg.groupby("Name").apply(applyWMA).reset_index(drop=True)
+        # playerAvg = playerAvg.groupby(["Name", "Map"]).apply(applyWMAMap).reset_index(drop=True)
+        playerAvg = playerAvg.groupby(["Name", "Map Number"]).apply(applyWMAMapNum).reset_index(drop=True)
+
+        latestData = playerAvg.groupby(["Name"]).tail(1)
+
+        print(latestData)
+
+        predData = playerAvg.dropna().copy()
+
+        predData.to_csv("Data/CS/PredictionData.csv")
+
+    else:
+        predData = pd.read_csv("Data/CS/PredictionData.csv")
+
+    return predData
+
+
+def PrizePicksComparison():
+    fittingData, x, y, xCols = readAndProcessWMAData(load=True)
+    loadModel()
+    networkModel.eval()
+    predData = getLatestPlayerData(load=True)
+    latestData = predData.groupby("Name").tail(1).copy()
+    map1Data = predData[predData["Map Number"] == 1.0].groupby("Name").tail(1).copy().reset_index()
+    map2Data = predData[predData["Map Number"] == 2.0].groupby("Name").tail(1).copy().reset_index()
+    map1Data = map1Data[map1Data["Name"].isin(map2Data["Name"])].reset_index()
+    map2Data = map2Data[map2Data["Name"].isin(map1Data["Name"])].reset_index()
+    map3Data = predData[predData["Map Number"] == 3.0].groupby("Name").tail(1).copy().reset_index()
+
+    map1X = latestData[latestData["Name"].isin(map1Data["Name"])].copy().reset_index()
+    map1X[xCols[1::2]] = map1Data[xCols[1::2]]
+    map1X = torch.Tensor(map1X[xCols].to_numpy())
+
+    with torch.no_grad():
+        map1Preds = networkModel(map1X).numpy()
+
+    pred1 = map1Data[["Name"]].copy()
+    pred1["Kills 1 Pred"] = map1Preds[:, 0]
+    pred1["HS 1 Pred"] = map1Preds[:, 1]
+
+    map2X = latestData[latestData["Name"].isin(map2Data["Name"])].copy().reset_index()
+    map2X[xCols[::2]] = (map2X[xCols[::2]] + map1Preds)/2
+    map2X[xCols[1::2]] = map2Data[xCols[1::2]]
+    map2X = torch.Tensor(map2X[xCols].to_numpy())
+
+    with torch.no_grad():
+        map2Preds = networkModel(map2X).numpy()
+
+    pred2 = map2Data[["Name"]].copy()
+    pred2["Kills 2 Pred"] = map2Preds[:, 0]
+    pred2["HS 2 Pred"] = map2Preds[:, 1]
+
+    pred12 = pd.merge(pred1, pred2, on="Name", how="inner")
+    pred12["Kills 1-2 Pred"] = pred12["Kills 1 Pred"] + pred12["Kills 2 Pred"]
+    pred12["HS 1-2 Pred"] = pred12["HS 1 Pred"] + pred12["HS 2 Pred"]
+
+    map3X = latestData[latestData["Name"].isin(map3Data["Name"])].copy().reset_index()
+    filteredPred2 = pred2[["Name"]].copy().reset_index()
+    filteredPred2[xCols[::2]] = map2Preds
+    map3X[xCols[::2]] = (map3X[xCols[::2]] + filteredPred2[xCols[::2]]) / 2
+    map3X[xCols[1::2]] = map3Data[xCols[1::2]]
+    map3X = torch.Tensor(map3X[xCols].to_numpy())
+
+    with torch.no_grad():
+        map3Preds = networkModel(map3X).numpy()
+
+    pred3 = map3Data[["Name"]].copy()
+    pred3["Kills 3 Pred"] = map3Preds[:, 0]
+    pred3["HS 3 Pred"] = map3Preds[:, 1]
+
+    relevantCols = ["Stat Type", "Player Name", "Line", "Actual"]
+    ppData = pd.read_csv("Data/CS/1day_hit_rate.csv")[relevantCols]
+    ppData = ppData.rename(columns={"Player Name": "Name"})
+    kills12Data = ppData[ppData["Stat Type"] == "MAPS 1-2 Kills"]
+    hs12Data = ppData[ppData["Stat Type"] == "MAPS 1-2 Headshots"]
+    kills3Data = ppData[ppData["Stat Type"] == "MAPS 3 Kills"]
+    hs3Data = ppData[ppData["Stat Type"] == "MAPS 3 Headshots"]
+
+    kills12Data = pd.merge(kills12Data, pred12[["Name", "Kills 1-2 Pred"]], on="Name", how="inner")
+    kills12Data = kills12Data.rename(columns={"Kills 1-2 Pred": "Prediction"})
+    hs12Data = pd.merge(hs12Data, pred12[["Name", "HS 1-2 Pred"]], on="Name", how="inner")
+    hs12Data = hs12Data.rename(columns={"HS 1-2 Pred": "Prediction"})
+
+    kills3Data = pd.merge(kills3Data, pred3[["Name", "Kills 3 Pred"]], on="Name", how="inner")
+    kills3Data = kills3Data.rename(columns={"Kills 3 Pred": "Prediction"})
+    hs3Data = pd.merge(hs3Data, pred3[["Name", "HS 3 Pred"]], on="Name", how="inner")
+    hs3Data = hs3Data.rename(columns={"HS 3 Pred": "Prediction"})
+
+    merged12 = pd.concat([kills12Data, hs12Data], ignore_index=True)
+    merged3 = pd.concat([kills3Data, hs3Data], ignore_index=True)
+
+    merged = pd.concat([merged12, merged3], ignore_index=True)
+    merged = merged.dropna()
+
+    def evaluate(df, label):
+        df["Over"] = df["Actual"] > df["Line"]
+        df["Predicted Over"] = df["Prediction"] > df["Line"]
+        hits = (df["Over"] == df["Predicted Over"]).sum()
+        acc = hits / len(df)
+
+        print(label + ": " + f"{acc * 100:.2f}%")
+
+    print()
+    evaluate(merged12, "Map 1-2")
+    evaluate(merged3, "Map 3")
+    evaluate(merged, "Overall")
+
+
+# run()
+PrizePicksComparison()

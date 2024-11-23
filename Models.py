@@ -3,7 +3,7 @@ import torch
 
 
 class FFN(nn.Module):
-    def __init__(self, inputSize=23, outputSize=2, hiddenSizes=(32,), conversionSizes=(32, 16)):
+    def __init__(self, inputSize=18, outputSize=9, hiddenSizes=(32,), conversionSizes=(32, 16)):
         super().__init__()
         assert len(hiddenSizes) > 0
         self.inputLayer = nn.Linear(inputSize, hiddenSizes[0])
