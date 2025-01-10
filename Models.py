@@ -3,14 +3,16 @@ import torch
 
 
 class FFN(nn.Module):
-    def __init__(self, inputSize=18, outputSize=9, hiddenSizes=(32,), conversionSizes=(32, 16)):
+    def __init__(self, inputSize=11, outputSize=2, hiddenSizes=(32, 32, 32), conversionSizes=(16, 4)):
         super().__init__()
         assert len(hiddenSizes) > 0
         self.inputLayer = nn.Linear(inputSize, hiddenSizes[0])
         self.hiddenLayers = nn.ModuleList()
+        self.batchNorms = nn.ModuleList()
         for hiddenIndex in range(1, len(hiddenSizes)):
-            self.hiddenLayers.append(nn.Linear(hiddenSizes[hiddenIndex - 1], hiddenSizes[hiddenIndex]))
-
+            outSize = hiddenSizes[hiddenIndex]
+            self.hiddenLayers.append(nn.Linear(hiddenSizes[hiddenIndex - 1], outSize))
+            self.batchNorms.append(nn.BatchNorm1d(outSize))
         self.conversionLayers = nn.ModuleList()
         for i in range(outputSize):
             layerList = nn.ModuleList()
@@ -26,8 +28,10 @@ class FFN(nn.Module):
     def forward(self, x):
         relu = nn.LeakyReLU()
         x = relu(self.inputLayer(x))
-        for hiddenLayer in self.hiddenLayers:
-            x = relu(hiddenLayer(x))
+        for i in range(len(self.hiddenLayers)):
+            layer = self.hiddenLayers[i]
+            BN = self.batchNorms[i]
+            x = relu(BN(layer(x)))
         outputs = []
         for layerList in self.conversionLayers:
             tempX = x
