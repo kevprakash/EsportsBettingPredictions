@@ -103,8 +103,6 @@ def getMergedTable():
         suffixes=("", "_HS")
     )[["player_name", "game_date", "line_score", "line_score_HS", "odds"]]
 
-    print(map12Lines)
-
     map12LineData = pd.merge(
         map12Lines,
         map12Data,
@@ -114,13 +112,15 @@ def getMergedTable():
     )[["name", "date", "map_number", "kills", "headshots", "assists", "deaths", "team_score", "opponent_score", "line_score", "line_score_HS", "odds"]]
 
     map12LineData["Rounds"] = map12LineData["team_score"] + map12LineData["opponent_score"]
+    map12LineData["Round%"] = (map12LineData["Rounds"] - 26)/26
     map12LineData["KPR"] = map12LineData["kills"]/map12LineData["Rounds"]
     map12LineData["HSPR"] = map12LineData["headshots"]/map12LineData["Rounds"]
     map12LineData["APR"] = map12LineData["assists"] / map12LineData["Rounds"]
     map12LineData["DPR"] = map12LineData["deaths"] / map12LineData["Rounds"]
+    map12LineData["HS%"] = map12LineData["headshots"] / map12LineData["kills"]
 
-    map12LineData = map12LineData.sort_values(by="date")
-    runningAverage = map12LineData.groupby("name")[["kills", "headshots", "assists", "deaths", "Rounds", "KPR", "HSPR", "APR", "DPR", "odds"]].shift(1).rolling(window=5, min_periods=1).mean()
+    map12LineData = map12LineData.sort_values(by="date").dropna()
+    runningAverage = map12LineData.groupby("name")[["kills", "headshots", "HS%", "assists", "deaths", "Rounds", "Round%", "KPR", "HSPR", "APR", "DPR", "odds"]].shift(1).rolling(window=5, min_periods=1).mean()
     runningAverage = runningAverage.add_suffix("_avg")
 
     map12LineData = pd.concat([map12LineData, runningAverage], axis=1).dropna()
